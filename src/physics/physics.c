@@ -117,14 +117,14 @@ void PhysicsInit(PhysicsWorld *w)
     /* Player sits at the positive-Z end of the table; AI at negative Z.
      * Both start centred (x = 0) and at a comfortable wrist height. */
     w->player = (PaddleBody){
-        .position   = { 0.0f, 1.25f, 3.45f },  /* Human player's end  */
+        .position   = { 0.0f, 1.55f, 3.45f },  /* Human player's end (tableY + 0.40m) */
         .velocity   = { 0.0f, 0.0f,  0.0f  },
         .halfWidth  = 0.48f,
         .halfHeight = 0.34f
     };
 
     w->ai = (PaddleBody){
-        .position   = { 0.0f, 1.25f, -3.45f }, /* AI's end            */
+        .position   = { 0.0f, 1.55f, -3.45f }, /* AI's end (tableY + 0.40m) */
         .velocity   = { 0.0f, 0.0f,   0.0f  },
         .halfWidth  = 0.48f,
         .halfHeight = 0.34f
@@ -279,16 +279,16 @@ static void IntegrateBall(PhysicsWorld *w, float dt)
  * ========================================================================= */
 static bool PaddleContact(const BallBody *b, const PaddleBody *p)
 {
-    /* Z depth check: ball must be within 22 cm of the paddle face. */
-    if (fabsf(b->position.z - p->position.z) > 0.22f)
+    /* Z depth check: 35 cm tolerance prevents tunneling at high velocities. */
+    if (fabsf(b->position.z - p->position.z) > 0.35f)
         return false;
 
-    /* X lateral check: ball centre within halfWidth + radius of paddle centre. */
-    if (fabsf(b->position.x - p->position.x) > p->halfWidth + b->radius)
+    /* X lateral check: ball centre within halfWidth + radius + generous margin. */
+    if (fabsf(b->position.x - p->position.x) > p->halfWidth + b->radius + 0.12f)
         return false;
 
-    /* Y height check: ball centre within halfHeight + radius of paddle centre. */
-    if (fabsf(b->position.y - p->position.y) > p->halfHeight + b->radius)
+    /* Y height check: ball centre within halfHeight + radius + generous margin. */
+    if (fabsf(b->position.y - p->position.y) > p->halfHeight + b->radius + 0.12f)
         return false;
 
     return true;
@@ -366,9 +366,7 @@ static void ApplyPaddleHit(PhysicsWorld *w, PaddleBody *p, bool player, float ch
     /* --- Apply new velocity --------------------------------------------- */
     b->velocity.x = offX * 2.6f                    /* Lateral deflection from offset    */
                   + p->velocity.x * 0.28f;          /* Carry-through of paddle motion    */
-    b->velocity.y = 2.2f                            /* Base loft                         */
-                  + offY * 1.7f                     /* Edge height bonus/penalty         */
-                  + charge * 2.3f;                  /* Smash power increases loft        */
+    b->velocity.y = fmaxf(1.6f, 2.2f + offY * 1.2f + charge * 2.3f); /* Minimum loft guarantees net clearance */
     b->velocity.z = dir * power;                    /* Full forward drive                */
 
     /* --- Spin accumulation --------------------------------------------- */
@@ -381,8 +379,12 @@ static void ApplyPaddleHit(PhysicsWorld *w, PaddleBody *p, bool player, float ch
     });
 
     /* --- Depenetration nudge -------------------------------------------- */
-    /* Push ball away from paddle face by 12 cm to prevent re-contact. */
-    b->position.z += dir * 0.12f;
+    /* Securely place the ball on the active front face of the paddle */
+    if (player) {
+        b->position.z = p->position.z - (b->radius + 0.08f);
+    } else {
+        b->position.z = p->position.z + (b->radius + 0.08f);
+    }
 
     /* Record who hit last for scoring attribution. */
     w->lastHitter = player ? 1 : 2;
@@ -530,8 +532,12 @@ void PhysicsUpdate(PhysicsWorld  *w,
                              -w->tableW * 0.5f + 0.55f,
                               w->tableW * 0.5f - 0.55f);
 
-    /* AI always keeps its paddle at a fixed comfortable height. */
-    ai->position.y = w->tableY + 0.70f;
+    /* AI keeps paddle at natural bounce sweet spot, tracking ball height when live. */
+    if (w->ball.inPlay) {
+        ai->position.y = ClampF(w->ball.position.y, w->tableY + 0.20f, w->tableY + 0.65f);
+    } else {
+        ai->position.y = w->tableY + 0.40f;
+    }
 
     /* -----------------------------------------------------------------------
      * 3. Ball physics (only while ball is in play).
@@ -610,16 +616,19 @@ void PhysicsUpdate(PhysicsWorld  *w,
 
         if (playerInRange
             && b->velocity.z > 0.0f       /* Ball travelling toward player  */
-            && w->lastHitter != 1          /* Player hasn't just hit it      */
-            && in.hit)                     /* Player pressed hit this frame  */
+            && w->lastHitter != 1)         /* Player hasn't just hit it      */
         {
-            ApplyPaddleHit(w, p, true, in.smash ? in.charge : 0.0f);
+            /* If player triggered smash or drive (click/hold), apply full active power;
+             * otherwise perform a solid passive block return! The ball will never
+             * unrealistically pass through the racket face. */
+            float power = in.smash ? in.charge : (in.hit ? 0.40f : 0.0f);
+            ApplyPaddleHit(w, p, true, power);
         }
         else if (aiInRange
                  && b->velocity.z < 0.0f  /* Ball travelling toward AI      */
                  && w->lastHitter != 2)    /* AI hasn't just hit it          */
         {
-            ApplyPaddleHit(w, ai, false, 0.05f);
+            ApplyPaddleHit(w, ai, false, 0.05f + difficulty * 0.20f);
         }
 
         /* -------------------------------------------------------------------

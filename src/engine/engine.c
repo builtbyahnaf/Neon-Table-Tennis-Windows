@@ -106,7 +106,7 @@ static Vector3 MouseToPaddle(GameEngine *g)
 
     /* ── World-space target ─────────────────────────────────────────────── */
     float wx = nx * 2.1f;                                   /* lateral   */
-    float wy = g->physics.tableY + 0.95f - ny * 0.95f;     /* vertical  */
+    float wy = g->physics.tableY + 0.40f - ny * 0.45f;     /* vertical: aligned with ball bounce height */
 
     /*
      * World Z: fixed paddle depth at 3.45f (player's near edge), then clamped
@@ -409,7 +409,8 @@ void EngineUpdate(GameEngine *g, float dt)
         /* ── Step 2: Build physics input from mouse and keyboard ── */
         PhysicsInput in = {
             .target = MouseToPaddle(g),                         /* Desired paddle world pos */
-            .hit    = IsMouseButtonPressed(MOUSE_BUTTON_LEFT),  /* Drive the ball           */
+            .hit    = IsMouseButtonPressed(MOUSE_BUTTON_LEFT) ||
+                      IsMouseButtonDown(MOUSE_BUTTON_LEFT),     /* Drive the ball (click or hold) */
             .smash  = false,                                     /* Overridden below         */
             .charge = 0.0f                                       /* Overridden below         */
         };
@@ -441,10 +442,11 @@ void EngineUpdate(GameEngine *g, float dt)
 
         /* ── Step 4: Physics simulation step ── */
 
-        /* Snapshot scores before the update to detect changes. */
-        int oldRally = g->rally;
-        int oldPS    = g->playerScore;
-        int oldAS    = g->aiScore;
+        /* Snapshot scores and last hitter before the update to detect hit events. */
+        int oldRally  = g->rally;
+        int oldPS     = g->playerScore;
+        int oldAS     = g->aiScore;
+        int oldHitter = g->physics.lastHitter;
 
         PhysicsUpdate(
             &g->physics,
@@ -458,25 +460,20 @@ void EngineUpdate(GameEngine *g, float dt)
 
         /* ── Step 5: Audio and particle events triggered by physics ── */
 
-        /* Player hit event. */
-        if (in.hit) {
-            /*
-             * Speed scalar: 7 + charge * 4   (see formula in block-comment)
-             *   Regular drive (charge=0) → speed 7
-             *   Full smash   (charge=1) → speed 11
-             */
-            AudioPlayHit(&g->audio, in.smash, 7.0f + in.charge * 4.0f);
+        /* Paddle hit event: triggers whenever either player or AI strikes the ball. */
+        if (g->physics.lastHitter != oldHitter && g->physics.ball.inPlay) {
+            bool isPlayer = (g->physics.lastHitter == 1);
+            bool isSmash  = isPlayer && in.smash;
+            float hitSpeed = V3Len(g->physics.ball.velocity);
 
-            /* Spawn a particle burst at the ball's current position.
-             * Smash → larger pink burst (45 particles, 3.5 impulse)
-             * Drive → smaller cyan burst (18 particles, 1.8 impulse)  */
-            AnimHitJuice(&g->anim, in.smash);
+            AudioPlayHit(&g->audio, isSmash, hitSpeed);
+            AnimHitJuice(&g->anim, isSmash);
             AnimBurst(
                 &g->anim,
                 g->physics.ball.position,
-                in.smash ? C_PINK  : C_CYAN,
-                in.smash ? 45      : 18,
-                in.smash ? 3.5f    : 1.8f
+                isPlayer ? (isSmash ? C_PINK : C_CYAN) : C_PINK,
+                isSmash ? 45 : 20,
+                isSmash ? 3.5f : 1.8f
             );
         }
 
