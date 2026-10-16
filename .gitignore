@@ -1,7 +1,7 @@
 build/
-*.o
-*.exe
-neon_table_tennis
+
+
+
 neon_table_tennis.sqlite
 neon_table_tennis.sqlite-shm
 neon_table_tennis.sqlite-wal
