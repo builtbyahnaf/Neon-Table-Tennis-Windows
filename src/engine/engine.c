@@ -433,32 +433,46 @@ void EngineUpdate(GameEngine *g, float dt)
             g->smashBuffer = 0.0f;
         }
 
-        /* While held: accumulate charge at a rate of 0.75 per second,
-         * clamped to [0, 1] so it never exceeds a full bar. */
+        /* While held: accumulate charge smoothly, reaching full in ~0.75s */
         if (g->charging && IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
-            g->charge = ClampF(g->charge + dt * 0.75f, 0.0f, 1.0f);
+            g->charge = ClampF(g->charge + dt * 1.35f, 0.0f, 1.0f);
         }
 
-        /* Right click release: prime the smash for a buffer window of 0.22s. */
+        /* Right click release: prime the smash for a generous 0.40s window */
         if (g->charging && IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)) {
             g->charging    = false;
-            g->smashBuffer = 0.22f; /* Buffer window so players don't need frame-perfect timing */
+            g->smashBuffer = 0.40f;
         }
 
-        bool smashActive = false;
         if (g->smashBuffer > 0.0f) {
             g->smashBuffer -= dt;
-            smashActive = true;
+            if (g->smashBuffer <= 0.0f) {
+                g->charge = 0.0f;
+            }
         }
 
         /* ── Step 3: Build physics input from mouse and keyboard ── */
+        /*
+         * in.hit is always true: auto-return ensures rallies stay alive.
+         * Smash triggers either while holding right-click with charge, or
+         * when released during the smashBuffer window. Left-click gives a drive.
+         */
+        bool smashHolding  = IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && (g->charge > 0.15f);
+        bool smashBuffered = (g->smashBuffer > 0.0f) && (g->charge > 0.15f);
+        bool isSmash       = smashHolding || smashBuffered;
+
+        float effectiveCharge = 0.0f;
+        if (isSmash) {
+            effectiveCharge = g->charge;
+        } else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            effectiveCharge = 0.40f; /* Left-click = crisp drive */
+        }
+
         PhysicsInput in = {
-            .target = MouseToPaddle(g),                         /* Desired paddle world pos */
-            .hit    = IsMouseButtonPressed(MOUSE_BUTTON_LEFT) ||
-                      IsMouseButtonDown(MOUSE_BUTTON_LEFT) ||
-                      smashActive,                              /* Drive the ball (click, hold, or primed smash) */
-            .smash  = smashActive,                              /* Power smash flag          */
-            .charge = smashActive ? g->charge : 0.0f            /* Charge level [0, 1]       */
+            .target = MouseToPaddle(g),
+            .hit    = true,                              /* Always auto-return        */
+            .smash  = isSmash,                           /* Power smash flag          */
+            .charge = effectiveCharge                    /* Scaled power [0, 1]       */
         };
 
         /* ── Step 4: Physics simulation step ── */
@@ -484,22 +498,23 @@ void EngineUpdate(GameEngine *g, float dt)
         /* Paddle hit event: triggers whenever either player or AI strikes the ball. */
         if (g->physics.lastHitter != oldHitter && g->physics.ball.inPlay) {
             bool isPlayer  = (g->physics.lastHitter == 1);
-            bool isSmash   = isPlayer && in.smash;
+            bool wasSmash  = isPlayer && (in.charge >= 0.45f);
             float hitSpeed = V3Len(g->physics.ball.velocity);
 
-            if (isPlayer && isSmash) {
+            if (isPlayer) {
                 g->smashBuffer = 0.0f;
                 g->charge      = 0.0f;
+                g->charging    = false;
             }
 
-            AudioPlayHit(&g->audio, isSmash, hitSpeed);
-            AnimHitJuice(&g->anim, isSmash);
+            AudioPlayHit(&g->audio, wasSmash, hitSpeed);
+            AnimHitJuice(&g->anim, wasSmash);
             AnimBurst(
                 &g->anim,
                 g->physics.ball.position,
-                isPlayer ? (isSmash ? C_PINK : C_CYAN) : C_PINK,
-                isSmash ? 45 : 20,
-                isSmash ? 3.5f : 1.8f
+                isPlayer ? (wasSmash ? C_PINK : C_CYAN) : C_PINK,
+                wasSmash ? 45 : 20,
+                wasSmash ? 3.5f : 1.8f
             );
         }
 
@@ -822,11 +837,23 @@ void EngineDraw(GameEngine *g)
             24, sh - 36, 16, (Color){ 165, 195, 225, 255 }
         );
 
-        /* ── Smash charge bar (only while charging) ───────────────────────── */
-        if (g->charging) {
-            DrawRectangle(24, sh - 65, 220, 10, (Color){ 30, 40, 60, 255 });   /* Background */
-            DrawRectangle(24, sh - 65, (int)(220.0f * g->charge), 10, C_PINK); /* Filled portion */
-            DrawText("SMASH CHARGE", 254, sh - 70, 14, C_PINK);
+        /* ── Smash charge bar (while charging or while smash buffer is active) ── */
+        if (g->charging || g->smashBuffer > 0.0f) {
+            int barW = 230;
+            int barH = 14;
+            int barX = 24;
+            int barY = sh - 68;
+            DrawRectangle(barX, barY, barW, barH, (Color){ 20, 28, 48, 230 });
+            DrawRectangleLines(barX, barY, barW, barH, (Color){ 65, 85, 130, 255 });
+
+            int fillW = (int)((float)(barW - 4) * g->charge);
+            Color barCol = (g->charge >= 0.95f) ? (Color){ 255, 85, 230, 255 } : C_PINK;
+            if (fillW > 0) {
+                DrawRectangle(barX + 2, barY + 2, fillW, barH - 4, barCol);
+            }
+
+            const char *label = (g->charge >= 0.95f) ? "MAX SMASH READY!" : "SMASH CHARGE";
+            DrawText(label, barX + barW + 14, barY - 1, 14, barCol);
         }
 
         /* ── STATE_PAUSE overlay ─────────────────────────────────────────── */
