@@ -104,9 +104,9 @@ static Vector3 MouseToPaddle(GameEngine *g)
     float nx = (m.x / (float)GetScreenWidth())  * 2.0f - 1.0f; /* [-1, +1] L→R */
     float ny = (m.y / (float)GetScreenHeight()) * 2.0f - 1.0f; /* [-1, +1] T→B */
 
-    /* ── World-space target ─────────────────────────────────────────────── */
-    float wx = nx * 2.1f;                                   /* lateral   */
-    float wy = g->physics.tableY + 0.40f - ny * 0.45f;     /* vertical: aligned with ball bounce height */
+    /* ── World-space target: increased sensitivity for smooth, agile response ── */
+    float wx = nx * 3.10f;                                  /* lateral: ~48% higher sensitivity */
+    float wy = g->physics.tableY + 0.45f - ny * 0.65f;     /* vertical: increased sensitivity & range */
 
     /*
      * World Z: fixed paddle depth at 3.45f (player's near edge), then clamped
@@ -128,11 +128,11 @@ static Vector3 MouseToPaddle(GameEngine *g)
  *
  * Resets performed:
  *   • playerScore, aiScore, rally → 0
- *   • charge → 0, charging → false
+ *   • charge → 0, charging → false, smashBuffer → 0
  *   • matchTime → 0  (used by the difficulty ramp formula)
  *   • difficulty → 0.65f  (slightly above the ramp floor of 0.58f;
  *                           gives the AI a small head-start reaction)
- *   • PhysicsWorld is fully re-initialised so the ball is in a clean state.
+ *   • PhysicsWorld is fully re-initialised with targetScore so the ball is in a clean state.
  *
  * Parameters:
  *   g — pointer to the live GameEngine.
@@ -144,10 +144,12 @@ static void StartMatch(GameEngine *g)
     g->rally       = 0;
     g->charge      = 0.0f;
     g->charging    = false;
+    g->smashBuffer = 0.0f;
     g->matchTime   = 0.0f;
     g->difficulty  = 0.65f;   /* See difficulty ramp comment in EngineUpdate */
 
     PhysicsInit(&g->physics);
+    g->physics.targetScore = (g->targetScore > 0) ? g->targetScore : 11;
     CoreSetState(&g->core, STATE_MATCH);
 }
 
@@ -188,8 +190,11 @@ bool EngineInit(GameEngine *g)
     /* Zero-init prevents any subsystem seeing garbage data during init. */
     memset(g, 0, sizeof(*g));
 
+    g->targetScore = 11;        /* Default to regulation Table Tennis 11-point match */
+
     CoreInit(&g->core);
     PhysicsInit(&g->physics);
+    g->physics.targetScore = g->targetScore;
     AnimInit(&g->anim, 1200);   /* 1 200 simultaneous particles maximum */
 
     if (!DBOpen(&g->db, "neon_table_tennis.sqlite")) {
@@ -328,19 +333,35 @@ void EngineUpdate(GameEngine *g, float dt)
     /* ── STATE_MENU ──────────────────────────────────────────────────────── */
     if (c->state == STATE_MENU) {
         /*
-         * Define the four menu button rectangles.  Layout is centred
-         * horizontally, stacked vertically with 80px spacing.
-         * Button click detection uses IsMouseButtonReleased + AABB test.
+         * Define target score buttons (5, 7, 11, 21) and the four main menu button
+         * rectangles. Button click detection uses IsMouseButtonReleased + AABB test.
          * UIButtonDraw() is NOT called here — that happens in EngineDraw().
          */
-        float cx = (float)(GetScreenWidth() / 2 - 140);
+        int sw = GetScreenWidth();
+        Vector2 mouse    = GetMousePosition();
+        bool    clicked  = IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
+
+        const int scoreOptions[4] = { 5, 7, 11, 21 };
+        float scoreBtnW = 60.0f;
+        float scoreBtnH = 38.0f;
+        float scoreGap  = 14.0f;
+        float totalScoreW = 4.0f * scoreBtnW + 3.0f * scoreGap;
+        float scoreStartX = (float)(sw / 2) - totalScoreW * 0.5f;
+        float scoreY = 320.0f;
+
+        for (int i = 0; i < 4; i++) {
+            Rectangle rOpt = { scoreStartX + (float)i * (scoreBtnW + scoreGap), scoreY, scoreBtnW, scoreBtnH };
+            if (clicked && CheckCollisionPointRec(mouse, rOpt)) {
+                g->targetScore = scoreOptions[i];
+                AudioPlayUI(&g->audio);
+            }
+        }
+
+        float cx = (float)(sw / 2 - 140);
         Rectangle rStart       = { cx, 390.0f, 280.0f, 60.0f };
         Rectangle rHowToPlay   = { cx, 470.0f, 280.0f, 60.0f };
         Rectangle rLeaderboard = { cx, 550.0f, 280.0f, 60.0f };
         Rectangle rQuit        = { cx, 630.0f, 280.0f, 60.0f };
-
-        Vector2 mouse    = GetMousePosition();
-        bool    clicked  = IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
 
         if (clicked && CheckCollisionPointRec(mouse, rStart)) {
             AudioPlayUI(&g->audio);
@@ -400,45 +421,45 @@ void EngineUpdate(GameEngine *g, float dt)
         /*
          * Difficulty ramp (see formula in function block-comment above):
          *   difficulty = clamp( 0.58 + matchTime/150.0,  0.58,  0.92 )
-         *
-         * The value is passed to PhysicsUpdate, which uses it to scale the
-         * AI paddle's reaction speed and prediction accuracy.
          */
         g->difficulty = ClampF(0.58f + g->matchTime / 150.0f, 0.58f, 0.92f);
 
-        /* ── Step 2: Build physics input from mouse and keyboard ── */
-        PhysicsInput in = {
-            .target = MouseToPaddle(g),                         /* Desired paddle world pos */
-            .hit    = IsMouseButtonPressed(MOUSE_BUTTON_LEFT) ||
-                      IsMouseButtonDown(MOUSE_BUTTON_LEFT),     /* Drive the ball (click or hold) */
-            .smash  = false,                                     /* Overridden below         */
-            .charge = 0.0f                                       /* Overridden below         */
-        };
-
-        /* ── Step 3: Smash-charge accumulation (right mouse button) ── */
+        /* ── Step 2: Smash-charge accumulation (right mouse button) ── */
 
         /* Right click start: begin charging. */
         if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
-            g->charging = true;
-            g->charge   = 0.0f;
+            g->charging    = true;
+            g->charge      = 0.0f;
+            g->smashBuffer = 0.0f;
         }
 
-        /* While held: accumulate charge at a rate of 0.65 per second,
+        /* While held: accumulate charge at a rate of 0.75 per second,
          * clamped to [0, 1] so it never exceeds a full bar. */
         if (g->charging && IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
-            g->charge = ClampF(g->charge + dt * 0.65f, 0.0f, 1.0f);
+            g->charge = ClampF(g->charge + dt * 0.75f, 0.0f, 1.0f);
         }
 
-        /* Right click release: fire the smash with the accumulated charge. */
+        /* Right click release: prime the smash for a buffer window of 0.22s. */
         if (g->charging && IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)) {
-            in.hit    = true;
-            in.smash  = true;
-            in.charge = g->charge;  /* [0, 1] — passed to audio & physics */
-            g->charging = false;
-
-            /* Trigger a camera-kick and screen-shake via the anim engine. */
-            AnimHitJuice(&g->anim, true);
+            g->charging    = false;
+            g->smashBuffer = 0.22f; /* Buffer window so players don't need frame-perfect timing */
         }
+
+        bool smashActive = false;
+        if (g->smashBuffer > 0.0f) {
+            g->smashBuffer -= dt;
+            smashActive = true;
+        }
+
+        /* ── Step 3: Build physics input from mouse and keyboard ── */
+        PhysicsInput in = {
+            .target = MouseToPaddle(g),                         /* Desired paddle world pos */
+            .hit    = IsMouseButtonPressed(MOUSE_BUTTON_LEFT) ||
+                      IsMouseButtonDown(MOUSE_BUTTON_LEFT) ||
+                      smashActive,                              /* Drive the ball (click, hold, or primed smash) */
+            .smash  = smashActive,                              /* Power smash flag          */
+            .charge = smashActive ? g->charge : 0.0f            /* Charge level [0, 1]       */
+        };
 
         /* ── Step 4: Physics simulation step ── */
 
@@ -462,9 +483,14 @@ void EngineUpdate(GameEngine *g, float dt)
 
         /* Paddle hit event: triggers whenever either player or AI strikes the ball. */
         if (g->physics.lastHitter != oldHitter && g->physics.ball.inPlay) {
-            bool isPlayer = (g->physics.lastHitter == 1);
-            bool isSmash  = isPlayer && in.smash;
+            bool isPlayer  = (g->physics.lastHitter == 1);
+            bool isSmash   = isPlayer && in.smash;
             float hitSpeed = V3Len(g->physics.ball.velocity);
+
+            if (isPlayer && isSmash) {
+                g->smashBuffer = 0.0f;
+                g->charge      = 0.0f;
+            }
 
             AudioPlayHit(&g->audio, isSmash, hitSpeed);
             AnimHitJuice(&g->anim, isSmash);
@@ -485,16 +511,22 @@ void EngineUpdate(GameEngine *g, float dt)
             AnimBurst(&g->anim, g->physics.ball.position, C_GREEN, 8, 1.0f);
         }
 
-        /* ── Step 6: Score-change detection and match-end logic ── */
+        /* ── Step 6: Score-change detection and Table Tennis match-end logic ── */
         if (oldPS != g->playerScore || oldAS != g->aiScore) {
 
-            /* Always spawn a dramatic burst at a fixed mid-table position
-             * to signal that a point was scored. */
+            /* Spawn dramatic particle burst to signal a point was won */
             AnimBurst(&g->anim, (Vector3){ 0.0f, 2.0f, 0.0f }, C_PINK, 45, 3.0f);
+            AudioPlayUI(&g->audio);
 
-            /* First to 7 points wins the match. */
-            if (g->playerScore >= 7 || g->aiScore >= 7) {
-                g->matchWon = (g->playerScore > g->aiScore);
+            /* Official Table Tennis rules:
+             * Match is won when a player reaches targetScore AND leads by at least 2 points.
+             * If tied at (targetScore - 1), play enters deuce until a 2-point lead is gained. */
+            int target = (g->targetScore > 0) ? g->targetScore : 11;
+            bool playerWon = (g->playerScore >= target && (g->playerScore - g->aiScore) >= 2);
+            bool aiWon     = (g->aiScore >= target && (g->aiScore - g->playerScore) >= 2);
+
+            if (playerWon || aiWon) {
+                g->matchWon = playerWon;
 
                 /* Persist the result to the high-score database. */
                 DBRecordMatch(&g->db, g->playerScore, g->rally, g->matchWon);
@@ -760,6 +792,27 @@ void EngineDraw(GameEngine *g)
         DrawText("YOU", sw / 2 - 145, 40, 16, C_CYAN);
         DrawText("CPU", sw / 2 + 105, 40, 16, C_PINK);
 
+        /* Table Tennis match status subtitle: DEUCE, ADVANTAGE, MATCH POINT, or TARGET */
+        int target = (g->targetScore > 0) ? g->targetScore : 11;
+        if (g->playerScore >= (target - 1) && g->aiScore >= (target - 1)) {
+            if (g->playerScore == g->aiScore) {
+                const char *deuceTxt = "DEUCE  --  WIN BY 2";
+                DrawText(deuceTxt, sw / 2 - MeasureText(deuceTxt, 15) / 2, 76, 15, C_PINK);
+            } else if (g->playerScore > g->aiScore) {
+                const char *advTxt = "ADVANTAGE PLAYER  --  MATCH POINT";
+                DrawText(advTxt, sw / 2 - MeasureText(advTxt, 15) / 2, 76, 15, C_CYAN);
+            } else {
+                const char *advTxt = "ADVANTAGE CPU  --  MATCH POINT";
+                DrawText(advTxt, sw / 2 - MeasureText(advTxt, 15) / 2, 76, 15, C_PINK);
+            }
+        } else if (g->playerScore == (target - 1) || g->aiScore == (target - 1)) {
+            const char *mpTxt = "MATCH POINT";
+            DrawText(mpTxt, sw / 2 - MeasureText(mpTxt, 15) / 2, 76, 15, C_PINK);
+        } else {
+            const char *tgtTxt = TextFormat("FIRST TO %d (WIN BY 2)", target);
+            DrawText(tgtTxt, sw / 2 - MeasureText(tgtTxt, 14) / 2, 76, 14, (Color){ 150, 190, 220, 210 });
+        }
+
         /* ── Rally counter ────────────────────────────────────────────────── */
         DrawText(TextFormat("RALLY %d", g->rally), 24, 24, 20, C_GREEN);
 
@@ -817,15 +870,60 @@ void EngineDraw(GameEngine *g)
                     "A little spin. A lot of attitude.", g->anim.time);
         DrawText("3D ARCADE EDITION", sw / 2 - 100, 245, 18, C_PINK);
 
+        /* ── Target Score Selector ────────────────────────────────────────── */
+        const char *scoreHeading = "MATCH LENGTH (FIRST TO LEAD BY 2):";
+        int headingW = MeasureText(scoreHeading, 15);
+        DrawText(scoreHeading, sw / 2 - headingW / 2, 292, 15, (Color){ 160, 200, 230, 230 });
+
+        const int scoreOptions[4] = { 5, 7, 11, 21 };
+        float scoreBtnW = 60.0f;
+        float scoreBtnH = 38.0f;
+        float scoreGap  = 14.0f;
+        float totalScoreW = 4.0f * scoreBtnW + 3.0f * scoreGap;
+        float scoreStartX = (float)(sw / 2) - totalScoreW * 0.5f;
+        float scoreY = 320.0f;
+
+        Vector2 mouse = GetMousePosition();
+        float   fdt   = GetFrameTime();
+
+        for (int i = 0; i < 4; i++) {
+            Rectangle rOpt = { scoreStartX + (float)i * (scoreBtnW + scoreGap), scoreY, scoreBtnW, scoreBtnH };
+            bool isSelected = (g->targetScore == scoreOptions[i]);
+            bool isHovered  = CheckCollisionPointRec(mouse, rOpt);
+
+            float scale = isHovered ? 1.04f : 1.0f;
+            Rectangle drawRec = {
+                rOpt.x - (rOpt.width * (scale - 1.0f) * 0.5f),
+                rOpt.y - (rOpt.height * (scale - 1.0f) * 0.5f),
+                rOpt.width * scale,
+                rOpt.height * scale
+            };
+
+            Color fillCol   = isSelected ? (Color){ 20, 85, 120, 245 }
+                            : (isHovered  ? (Color){ 18, 35, 60, 230 } : (Color){ 10, 20, 40, 200 });
+            Color borderCol = isSelected ? C_CYAN
+                            : (isHovered  ? (Color){ 100, 190, 230, 220 } : (Color){ 45, 80, 110, 160 });
+            Color textCol   = isSelected ? RAYWHITE
+                            : (isHovered  ? RAYWHITE : (Color){ 140, 175, 200, 210 });
+
+            DrawRectangleRounded(drawRec, 0.25f, 8, fillCol);
+            DrawRectangleRoundedLinesEx(drawRec, 0.25f, 8, isSelected ? 2.5f : 1.5f, borderCol);
+
+            const char *optTxt = TextFormat("%d", scoreOptions[i]);
+            int txtW = MeasureText(optTxt, 18);
+            DrawText(optTxt,
+                     (int)(drawRec.x + (drawRec.width - (float)txtW) * 0.5f),
+                     (int)(drawRec.y + (drawRec.height - 18.0f) * 0.5f),
+                     18, textCol);
+        }
+
         /*
          * Menu buttons: UIButtonDraw() is called here in the draw phase.
          * The return value (clicked) is IGNORED — click handling happened in
          * EngineUpdate() via CheckCollisionPointRec.  These calls are purely
          * for drawing the hover-glow animation on each button.
          */
-        Vector2 mouse = GetMousePosition();
-        float   fdt   = GetFrameTime();
-        float   cx    = (float)(sw / 2 - 140);
+        float cx = (float)(sw / 2 - 140);
 
         UIButton bStart       = { { cx, 390.0f, 280.0f, 60.0f }, "START MATCH",  0.0f, true };
         UIButton bHowToPlay   = { { cx, 470.0f, 280.0f, 60.0f }, "HOW TO PLAY",  0.0f, true };
@@ -848,7 +946,7 @@ void EngineDraw(GameEngine *g)
             "LEFT CLICK when the ball reaches your paddle to drive it back.",
             "HOLD RIGHT CLICK, then release for a charged smash.",
             "Offset hits add spin. The ball curves as it travels.",
-            "First player to 7 points wins. Press ENTER to return."
+            "First player to target score by 2 points wins. Press ENTER to return."
         };
 
         for (int i = 0; i < 5; i++) {

@@ -30,13 +30,18 @@ Neon Table Tennis is a complete, public-release-quality arcade game featuring a 
 
 | Input | Action |
 |---|---|
-| **Mouse move** | Guide your paddle across the table |
+| **Mouse move** | Guide your paddle with high-sensitivity, spring-damped tracking |
 | **Left click** | Drive (standard shot) |
-| **Hold Right click, release** | Charged smash (hold longer = more power) |
+| **Hold Right click, release** | Charged smash with buffered trigger window (hold longer = more power & topspin) |
 | **Escape** | Pause / resume / return to menu |
 | **Enter** or **click** | Advance tutorial, leaderboard, or game-over screen |
 
-First to **7 points** wins the match. Scoring uses an arcade ruleset: any ball that exits bounds scores a point for the opposing player.
+### Rules & Scoring
+- **Configurable Match Length** — Choose your minimum score to win (**5**, **7**, **11**, or **21** points) directly from the Main Menu.
+- **Table Tennis Rules** — The ball must bounce legally once on the receiver's court. If the receiver fails to return it (ball goes out after bouncing on receiver's court, double bounces, or dies on receiver's court), the **hitter wins the point**.
+- **Faults** — Hitting the ball out of bounds without landing on opponent's table, bouncing on your own side, or illegal volleys over the table award the point to your opponent.
+- **Win by 2 & Deuce** — Players must gain a 2-point margin to win. If tied at `target - 1`, the game enters deuce.
+- **Service Alternation** — Service changes every 2 points during regulation play and every 1 point during deuce.
 
 ---
 

@@ -77,8 +77,9 @@ typedef struct GameEngine {
     AudioMgr     audio;     /* Loaded sound effects and master volume             */
 
     /* ── Match bookkeeping ───────────────────────────────────────────────── */
-    int   playerScore;  /* Current player points (0–7).  First to 7 wins.       */
-    int   aiScore;      /* Current AI points (0–7).                             */
+    int   playerScore;  /* Current player points. First to targetScore with lead >= 2 wins. */
+    int   aiScore;      /* Current AI points.                                   */
+    int   targetScore;  /* Configurable minimum score to win (default 11; 5, 7, 11, 21) */
     int   rally;        /* Number of consecutive ball touches this exchange      */
     int   wins;         /* Career wins (informational; persisted via db)         */
     int   losses;       /* Career losses (informational; persisted via db)       */
@@ -86,13 +87,14 @@ typedef struct GameEngine {
     /* ── Smash-charge state ──────────────────────────────────────────────── */
     float charge;       /* [0, 1] — how full the smash charge bar is            */
     bool  charging;     /* true while right mouse button is held down           */
+    float smashBuffer;  /* Time window (seconds) during which a released smash remains primed */
 
     /* ── Per-match timing & AI difficulty ───────────────────────────────── */
     float matchTime;    /* Accumulated match time in seconds since StartMatch()  */
     float difficulty;   /* AI reaction scalar, ramps from 0.58 → 0.92 over time */
 
     /* ── End-of-match result ────────────────────────────────────────────── */
-    bool matchWon;      /* true if player reached 7 first, false if AI did      */
+    bool matchWon;      /* true if player won the match, false if AI did         */
 
     /* ── Rendering ──────────────────────────────────────────────────────── */
     Camera3D camera;    /* Base 3-D perspective camera (shake applied per frame) */

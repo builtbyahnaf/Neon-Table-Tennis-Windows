@@ -85,9 +85,13 @@ typedef struct PhysicsWorld
     float drag;               /* Quadratic drag coefficient  c in a=-c|v|v     */
     float magnus;             /* Magnus lift coefficient     k in a=k(ω×v)     */
 
-    /* Match flow. */
-    float serveTimer;         /* Seconds remaining before the next serve fires */
-    int   lastHitter;         /* 1 = player last hit, 2 = AI last hit, 0 = none */
+    /* Match flow & Table Tennis bounce tracking. */
+    float serveTimer;             /* Seconds remaining before the next serve fires */
+    int   lastHitter;             /* 1 = player last hit, 2 = AI last hit, 0 = none */
+    int   bouncesOnReceiverSide;  /* Number of bounces on receiver's court since last hit */
+    int   bouncesOnHitterSide;    /* Number of bounces on hitter's court since last hit   */
+    bool  netHit;                 /* True if ball clipped the net on current exchange     */
+    int   targetScore;            /* Minimum score to win (used for deuce service cadence)*/
 } PhysicsWorld;
 
 /* -------------------------------------------------------------------------

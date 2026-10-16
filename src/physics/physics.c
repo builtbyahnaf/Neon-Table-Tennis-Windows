@@ -180,8 +180,11 @@ void PhysicsServe(PhysicsWorld *w, int towardPlayer)
     w->ball.inPlay  = true;
     w->serveTimer   = 0.0f;
 
-    /* Record who served last for point attribution if faulted. */
-    w->lastHitter = (towardPlayer > 0) ? 2 : 1;  /* 2 = AI, 1 = player */
+    /* Record who served last and reset court bounce tracking. */
+    w->lastHitter            = (towardPlayer > 0) ? 2 : 1;  /* 2 = AI, 1 = player */
+    w->bouncesOnReceiverSide = 0;
+    w->bouncesOnHitterSide   = 0;
+    w->netHit                = false;
 }
 
 /* =========================================================================
@@ -356,8 +359,8 @@ static void ApplyPaddleHit(PhysicsWorld *w, PaddleBody *p, bool player, float ch
     float offY = ClampF((b->position.y - p->position.y) / p->halfHeight, -1.0f, 1.0f);
 
     /* --- Shot power scales with charge ---------------------------------- */
-    /* Range: 7.0 m/s (tap) to 10.8 m/s (full smash). */
-    float power = 7.0f + 3.8f * ClampF(charge, 0.0f, 1.0f);
+    /* Range: 7.2 m/s (tap) to 11.2 m/s (full smash). */
+    float power = 7.2f + 4.0f * ClampF(charge, 0.0f, 1.0f);
 
     /* --- Direction of travel after hit ---------------------------------- */
     /* player hits toward negative Z (toward AI); AI hits toward positive Z. */
@@ -366,17 +369,22 @@ static void ApplyPaddleHit(PhysicsWorld *w, PaddleBody *p, bool player, float ch
     /* --- Apply new velocity --------------------------------------------- */
     b->velocity.x = offX * 2.6f                    /* Lateral deflection from offset    */
                   + p->velocity.x * 0.28f;          /* Carry-through of paddle motion    */
-    b->velocity.y = fmaxf(1.6f, 2.2f + offY * 1.2f + charge * 2.3f); /* Minimum loft guarantees net clearance */
-    b->velocity.z = dir * power;                    /* Full forward drive                */
 
-    /* --- Spin accumulation --------------------------------------------- */
-    /* Spin is added to whatever the ball was already spinning with, so a
-     * brush contact on an already-spinning ball magnifies the effect. */
-    b->spin = V3Add(b->spin, (Vector3){
-         offY * 8.0f,    /* Topspin (+) or backspin (-) from vertical offset  */
-        -offX * 10.0f,   /* Sidespin left/right from horizontal offset         */
-         offX * 4.0f     /* Slight roll component                              */
-    });
+    /* Base loft tuned so regular drives clear the net and land neatly on the table,
+     * while charged smashes have a flatter trajectory and rely on topspin to dip. */
+    float baseLoft = (charge > 0.05f) ? (1.65f + offY * 0.5f - charge * 0.25f)
+                                      : (2.25f + offY * 0.8f);
+    b->velocity.y = fmaxf(1.40f, baseLoft);
+    b->velocity.z = dir * power;                    /* Forward drive                     */
+
+    /* --- Spin accumulation (Magnus effect) ------------------------------- */
+    /* Topspin creates a downward aerodynamic force in the direction of flight.
+     * With a_y = -dir * spin.x * |vel.z| * k, setting spin.x = dir * topspin
+     * guarantees downward Magnus acceleration for both player and AI. */
+    float topspin = (player ? (charge * 14.0f + 4.0f) : 3.5f) + offY * 5.0f;
+    b->spin.x = dir * topspin;
+    b->spin.y = -offX * 8.0f;                       /* Sidespin left/right               */
+    b->spin.z =  offX * 3.0f;                       /* Slight roll                       */
 
     /* --- Depenetration nudge -------------------------------------------- */
     /* Securely place the ball on the active front face of the paddle */
@@ -386,39 +394,25 @@ static void ApplyPaddleHit(PhysicsWorld *w, PaddleBody *p, bool player, float ch
         b->position.z = p->position.z + (b->radius + 0.08f);
     }
 
-    /* Record who hit last for scoring attribution. */
-    w->lastHitter = player ? 1 : 2;
+    /* Record who hit last and reset bounce tracking for this exchange. */
+    w->lastHitter            = player ? 1 : 2;
+    w->bouncesOnReceiverSide = 0;
+    w->bouncesOnHitterSide   = 0;
+    w->netHit                = false;
 }
 
 /* =========================================================================
  * PhysicsPredictLanding
  * =====================
  * Forward-simulate the ball's trajectory in a temporary local copy (so the
- * live world state is unaffected) and return the point where the ball will
- * next touch y = tableY.
- *
- * Algorithm
- * ---------
- * The prediction integrates the ball under gravity only (no drag, no Magnus)
- * at a 120 Hz sub-step (dt_sub = 1/120 s ≈ 8.33 ms).  For short-range shots
- * that last < 2 s, omitting drag introduces < 5 % error in landing position,
- * which is acceptable given that the AI also has a randomised difficulty
- * offset.
- *
- * Each sub-step:
- *   v_y -= g * dt_sub          (explicit Euler on y component)
- *   pos  += vel * dt_sub       (update all three components)
- *   if pos.y <= tableY + radius  →  landing detected, return clamped pos
- *
- * If maxTime elapses before landing (e.g. ball is still climbing) the ball's
- * projected position at that time is returned.  The AI will simply idle near
- * its last target until the next update recalculates.
+ * live world state is unaffected). Simulates through table bounce to find
+ * the point where the ball will cross the AI paddle intercept plane.
  *
  * Parameters:
  *   w        Read-only pointer to the current physics state.
  *   maxTime  Maximum look-ahead in seconds.
  *
- * Returns the predicted landing position (Vector3).
+ * Returns the predicted landing/intercept position (Vector3).
  * ========================================================================= */
 Vector3 PhysicsPredictLanding(const PhysicsWorld *w, float maxTime)
 {
@@ -427,24 +421,31 @@ Vector3 PhysicsPredictLanding(const PhysicsWorld *w, float maxTime)
 
     /* Sub-step: 120 Hz gives good arc resolution with low CPU cost. */
     const float dtSub = 1.0f / 120.0f;
+    float targetZ = w->ai.position.z;
 
     for (float t = 0.0f; t < maxTime; t += dtSub)
     {
-        /* Gravity only — ignoring drag and Magnus for speed. */
+        /* Gravity only — fast numerical look-ahead */
         b.velocity.y -= w->gravity * dtSub;
-
-        /* Advance position. */
         b.position = V3Add(b.position, V3Scale(b.velocity, dtSub));
 
-        /* Check if the ball has reached (or passed through) the table surface. */
-        if (b.position.y <= w->tableY + b.radius)
+        /* If ball touches the table surface, simulate bounce */
+        if (b.position.y <= w->tableY + b.radius && fabsf(b.position.z) <= w->tableL * 0.5f)
         {
-            /* Return the landing point with y clamped to the table surface. */
-            return (Vector3){ b.position.x, w->tableY, b.position.z };
+            b.position.y = w->tableY + b.radius;
+            b.velocity.y = fabsf(b.velocity.y) * 0.76f;
+            b.velocity.x *= 0.91f;
+            b.velocity.z *= 0.97f;
+        }
+
+        /* If ball is travelling toward AI and reaches AI paddle plane, return intercept */
+        if (b.velocity.z < 0.0f && b.position.z <= targetZ)
+        {
+            return (Vector3){ b.position.x, b.position.y, targetZ };
         }
     }
 
-    /* Ball did not land within the look-ahead window; return its future position. */
+    /* Ball did not cross plane within window; return future position */
     return b.position;
 }
 
@@ -496,34 +497,46 @@ void PhysicsUpdate(PhysicsWorld  *w,
      * --------------------------------------------------------------------- */
     Vector3 oldPos = p->position;
 
-    /* Clamp X: keep paddle at least halfWidth from the table edge. */
-    p->position.x = ClampF(in.target.x,
-                            -w->tableW * 0.5f + 0.55f,
-                             w->tableW * 0.5f - 0.55f);
-
-    /* Clamp Y: keep paddle between just above the table and head height. */
-    p->position.y = ClampF(in.target.y,
+    /* Clamp requested target to playable table extents */
+    float targetX = ClampF(in.target.x,
+                           -w->tableW * 0.5f + 0.55f,
+                            w->tableW * 0.5f - 0.55f);
+    float targetY = ClampF(in.target.y,
                             w->tableY + 0.15f,
                             w->tableY + 1.55f);
+
+    /* Responsive exponential smoothing (38 rad/s filter) ensures silky-smooth
+     * 3D paddle motion and prevents frame-rate discrete stepping artifacts. */
+    float smoothFactor = 1.0f - expf(-38.0f * dt);
+    p->position.x += (targetX - p->position.x) * smoothFactor;
+    p->position.y += (targetY - p->position.y) * smoothFactor;
 
     /* Finite-difference paddle velocity: v = Δx / dt (used in hit transfer). */
     float safeDt   = (dt > 0.0f) ? dt : 1.0f;  /* Guard against dt = 0 */
     p->velocity    = V3Scale(V3Sub(p->position, oldPos), 1.0f / safeDt);
 
     /* -----------------------------------------------------------------------
-     * 2. AI paddle: predict landing and bounded movement response.
+     * 2. AI paddle: predict intercept and bounded movement response.
      * --------------------------------------------------------------------- */
+    float aiTargetX = 0.0f;
 
-    /* Forward-simulate up to 1.7 s to find the landing point. */
-    Vector3 landing = PhysicsPredictLanding(w, 1.7f);
+    if (w->ball.inPlay && w->ball.velocity.z < 0.0f)
+    {
+        /* Ball is coming toward AI: predict intercept position at AI paddle plane */
+        Vector3 intercept = PhysicsPredictLanding(w, 1.7f);
 
-    /* Add random positional error inversely proportional to difficulty.
-     * rand range [-1, 1] scaled by (1-difficulty)*0.75 → max ±0.75 m at diff=0. */
-    float errorScale = (float)GetRandomValue(-100, 100) / 100.0f;
-    float aiTargetX  = landing.x + errorScale * (1.0f - difficulty) * 0.75f;
+        /* Add random positional error inversely proportional to difficulty */
+        float errorScale = (float)GetRandomValue(-100, 100) / 100.0f;
+        aiTargetX = intercept.x + errorScale * (1.0f - difficulty) * 0.65f;
+    }
+    else
+    {
+        /* Ball moving away or dead: AI recovers toward center */
+        aiTargetX = 0.0f;
+    }
 
-    /* Move at most MAX_AI_SPEED * difficulty per second toward targetX. */
-    float maxStep   = MAX_AI_SPEED * difficulty * dt;
+    /* Move toward aiTargetX at bounded speed scaled by difficulty */
+    float maxStep   = MAX_AI_SPEED * (0.60f + 0.40f * difficulty) * dt;
     float aiDeltaX  = ClampF(aiTargetX - ai->position.x, -maxStep, maxStep);
     ai->position.x += aiDeltaX;
 
@@ -532,11 +545,13 @@ void PhysicsUpdate(PhysicsWorld  *w,
                              -w->tableW * 0.5f + 0.55f,
                               w->tableW * 0.5f - 0.55f);
 
-    /* AI keeps paddle at natural bounce sweet spot, tracking ball height when live. */
-    if (w->ball.inPlay) {
-        ai->position.y = ClampF(w->ball.position.y, w->tableY + 0.20f, w->tableY + 0.65f);
+    /* AI tracks ball height when approaching; recovers to ready height otherwise */
+    if (w->ball.inPlay && w->ball.velocity.z < 0.0f) {
+        float targetAiY = ClampF(w->ball.position.y, w->tableY + 0.20f, w->tableY + 0.65f);
+        ai->position.y += (targetAiY - ai->position.y) * fminf(1.0f, dt * 14.0f);
     } else {
-        ai->position.y = w->tableY + 0.40f;
+        float readyY = w->tableY + 0.40f;
+        ai->position.y += (readyY - ai->position.y) * fminf(1.0f, dt * 8.0f);
     }
 
     /* -----------------------------------------------------------------------
@@ -550,171 +565,187 @@ void PhysicsUpdate(PhysicsWorld  *w,
         BallBody *b = &w->ball;
 
         /* -------------------------------------------------------------------
-         * 3b. Table surface bounce.
+         * 3b. Table surface bounce (Table Tennis rules).
          *
-         * Condition: ball's bottom edge (position.y - radius) has reached or
-         * passed the table surface, AND ball is within the table's Z span.
-         *
-         * Response:
-         *   • Clamp y to keep the ball on the surface (de-penetration).
-         *   • Reflect y velocity with a coefficient of restitution of 0.76:
-         *       vy_new = |vy_old| * 0.76
-         *     Taking fabsf first ensures we only ever bounce the ball upward,
-         *     regardless of floating-point drift.
-         *   • Apply friction on the horizontal axes:
-         *       vx *= 0.91  (more friction: ball scrubs laterally)
-         *       vz *= 0.97  (less friction: ball retains most forward speed)
-         *   • Rally counter increments on each table contact.
-         *
-         * Bug fixed: the original code clamped vy to a minimum of 1.1 m/s,
-         * which caused a slow rolling ball to bounce endlessly.  That clamp
-         * has been removed — if the ball doesn't have enough energy to bounce,
-         * it should simply stop, letting the out-of-bounds check score the point.
+         * Condition:
+         *   • Ball's bottom touches or penetrates the table surface.
+         *   • Ball is strictly within the table's X and Z boundaries.
+         *   • Ball is moving downward (vel.y <= 0) to avoid repeated triggering.
          * ----------------------------------------------------------------- */
-        bool onTable = (b->position.y - b->radius <= w->tableY)
-                    && (fabsf(b->position.z) < w->tableL * 0.5f);
+        bool inTableX   = fabsf(b->position.x) <= (w->tableW * 0.5f);
+        bool inTableZ   = fabsf(b->position.z) <= (w->tableL * 0.5f);
+        bool atTableY   = (b->position.y - b->radius <= w->tableY + 0.025f)
+                       && (b->position.y + b->radius >= w->tableY - 0.06f);
+        bool movingDown = (b->velocity.y <= 0.0f);
 
-        if (onTable)
+        if (inTableX && inTableZ && atTableY && movingDown)
         {
-            /* De-penetrate: place ball surface exactly on table top. */
+            /* De-penetrate: place ball on surface */
             b->position.y = w->tableY + b->radius;
 
-            /* Bounce: reflect y velocity with restitution coefficient 0.76. */
+            /* Bounce: reflect y velocity with restitution 0.76 */
             b->velocity.y = fabsf(b->velocity.y) * 0.76f;
 
-            /* Surface friction on horizontal components. */
+            /* Surface friction on horizontal components */
             b->velocity.x *= 0.91f;
             b->velocity.z *= 0.97f;
 
-            /* Count this as a rally touch. */
-            (*rally)++;
+            /* Check which court side the ball touched:
+             * Player court: z > 0, AI court: z < 0 */
+            bool touchedPlayerCourt = (b->position.z > 0.0f);
+            bool hitterIsPlayer     = (w->lastHitter == 1);
+
+            if (hitterIsPlayer == touchedPlayerCourt)
+            {
+                /* Ball bounced on the hitter's OWN court! (Fault in TT) */
+                w->bouncesOnHitterSide++;
+                if (hitterIsPlayer) {
+                    (*aiScore)++;
+                } else {
+                    (*playerScore)++;
+                }
+                w->ball.inPlay = false;
+                w->serveTimer  = 0.70f;
+            }
+            else
+            {
+                /* Ball bounced on the receiver's court! */
+                w->bouncesOnReceiverSide++;
+                if (w->bouncesOnReceiverSide == 1)
+                {
+                    /* Legal first bounce on receiver's side */
+                    (*rally)++;
+                }
+                else
+                {
+                    /* Double bounce! Receiver failed to return in time */
+                    if (hitterIsPlayer) {
+                        (*playerScore)++;
+                    } else {
+                        (*aiScore)++;
+                    }
+                    w->ball.inPlay = false;
+                    w->serveTimer  = 0.70f;
+                }
+            }
         }
 
         /* -------------------------------------------------------------------
          * 3c. Paddle contact checks.
-         *
-         * Player hit conditions:
-         *   • Ball overlaps player paddle AABB.
-         *   • Ball is moving toward player (vel.z > 0) — prevents double-hit
-         *     from a ball that has passed through and is rebounding.
-         *   • Player did not just hit it (lastHitter != 1) — no double-hit.
-         *   • Player pressed the hit button this frame (in.hit).
-         *
-         * AI hit conditions:
-         *   • Ball overlaps AI paddle AABB.
-         *   • Ball is moving toward AI (vel.z < 0).
-         *   • AI did not just hit it (lastHitter != 2).
-         *   • No player input required — AI always auto-hits when in range.
-         *   • A small charge (0.05) gives the AI a modest power shot.
-         *
-         * PaddleContact now derives the paddle Z from p->position.z directly
-         * (bug fix — the original passed hardcoded 3.12f for the player even
-         * though the paddle is at z = 3.45f).
          * ----------------------------------------------------------------- */
         bool playerInRange = PaddleContact(b, p);
         bool aiInRange     = PaddleContact(b, ai);
 
-        if (playerInRange
+        if (w->ball.inPlay && playerInRange
             && b->velocity.z > 0.0f       /* Ball travelling toward player  */
             && w->lastHitter != 1)         /* Player hasn't just hit it      */
         {
-            /* If player triggered smash or drive (click/hold), apply full active power;
-             * otherwise perform a solid passive block return! The ball will never
-             * unrealistically pass through the racket face. */
-            float power = in.smash ? in.charge : (in.hit ? 0.40f : 0.0f);
-            ApplyPaddleHit(w, p, true, power);
+            /* Check for illegal volley: in Table Tennis, hitting the ball over
+             * the table before it has bounced on your court is an obstruction fault. */
+            bool overTable = (fabsf(b->position.x) <= w->tableW * 0.5f) &&
+                             (fabsf(b->position.z) <= w->tableL * 0.5f);
+            if (w->bouncesOnReceiverSide == 0 && overTable)
+            {
+                /* Volley fault: AI scores */
+                (*aiScore)++;
+                w->ball.inPlay = false;
+                w->serveTimer  = 0.70f;
+            }
+            else
+            {
+                float power = in.smash ? in.charge : (in.hit ? 0.40f : 0.0f);
+                ApplyPaddleHit(w, p, true, power);
+            }
         }
-        else if (aiInRange
+        else if (w->ball.inPlay && aiInRange
                  && b->velocity.z < 0.0f  /* Ball travelling toward AI      */
                  && w->lastHitter != 2)    /* AI hasn't just hit it          */
         {
-            ApplyPaddleHit(w, ai, false, 0.05f + difficulty * 0.20f);
+            bool overTable = (fabsf(b->position.x) <= w->tableW * 0.5f) &&
+                             (fabsf(b->position.z) <= w->tableL * 0.5f);
+            if (w->bouncesOnReceiverSide == 0 && overTable)
+            {
+                /* Volley fault: Player scores */
+                (*playerScore)++;
+                w->ball.inPlay = false;
+                w->serveTimer  = 0.70f;
+            }
+            else
+            {
+                ApplyPaddleHit(w, ai, false, 0.05f + difficulty * 0.22f);
+            }
         }
 
         /* -------------------------------------------------------------------
          * 3d. Net collision & de-penetration.
-         *
-         * The net is located at z = 0 with half-thickness 0.05m.
-         * Net top is at tableY + 0.255m (matching the rendered net geometry).
-         *
-         * Bug Fix (The Net Trap):
-         * Previously, hitting the net merely multiplied vz by -0.35 without
-         * adjusting position. Because the ball remained inside the slab
-         * (|z| < 0.075), the collision condition triggered repeatedly every frame,
-         * multiplying velocity by 0.35 each time until the ball was permanently
-         * trapped inside the net at z = 0 with zero velocity.
-         *
-         * Resolution:
-         *   1. Detect approach direction (vz > 0: approaching from AI toward player;
-         *      vz < 0: approaching from player toward AI).
-         *   2. Immediately de-penetrate the ball by snapping its z position
-         *      outside the slab boundary.
-         *   3. Reflect vz away from the net and provide a small vertical bounce.
          * ----------------------------------------------------------------- */
         float netHalfThick = 0.05f;
         float netTop       = w->tableY + 0.255f;
         bool inNetSlab     = (fabsf(b->position.z) < netHalfThick + b->radius);
         bool belowNetTop   = (b->position.y < netTop);
 
-        if (inNetSlab && belowNetTop)
+        if (w->ball.inPlay && inNetSlab && belowNetTop)
         {
+            w->netHit = true;
             if (b->velocity.z > 0.0f)
             {
                 /* Travelling toward player: de-penetrate back to AI side */
                 b->position.z = -netHalfThick - b->radius - 0.02f;
-                b->velocity.z = -fabsf(b->velocity.z) * 0.45f;
-                b->velocity.y =  fabsf(b->velocity.y) * 0.40f + 0.60f;
+                b->velocity.z = -fabsf(b->velocity.z) * 0.40f;
+                b->velocity.y =  fabsf(b->velocity.y) * 0.35f + 0.55f;
             }
             else if (b->velocity.z < 0.0f)
             {
                 /* Travelling toward AI: de-penetrate back to player side */
                 b->position.z =  netHalfThick + b->radius + 0.02f;
-                b->velocity.z =  fabsf(b->velocity.z) * 0.45f;
-                b->velocity.y =  fabsf(b->velocity.y) * 0.40f + 0.60f;
+                b->velocity.z =  fabsf(b->velocity.z) * 0.40f;
+                b->velocity.y =  fabsf(b->velocity.y) * 0.35f + 0.55f;
             }
         }
 
         /* -------------------------------------------------------------------
-         * 3e. Out-of-bounds, dead-ball & scoring check.
-         *
-         * A point ends when:
-         *   1. The ball flies beyond the lateral table bounds (|x| > tableW * 0.52).
-         *   2. The ball flies beyond the baseline (|z| > tableL * 0.55).
-         *   3. The ball falls through the floor (y < -0.8m).
-         *   4. The ball becomes stalled/dead on the table (e.g. after hitting
-         *      the net or rolling to a halt: speed < 0.45 m/s near table surface).
+         * 3e. Out-of-bounds, dead-ball & scoring check (Table Tennis rules).
          * ----------------------------------------------------------------- */
-        bool outX   = fabsf(b->position.x) > w->tableW * 0.52f;
-        bool outZ   = fabsf(b->position.z) > w->tableL * 0.55f;
-        bool outY   = b->position.y < -0.8f;
-        bool out    = outX || outZ || outY;
-
-        /* Dead ball check: ball is near table top with negligible kinetic energy */
-        bool ballDead = onTable && (V3Len(b->velocity) < 0.45f);
-
-        if (out || ballDead)
+        if (w->ball.inPlay)
         {
-            if (ballDead)
-            {
-                /* If the ball died on player's half, player failed to return it -> AI scores.
-                 * If it died on AI's half, AI failed to return it -> player scores. */
-                if (b->position.z > 0.0f)
-                    (*aiScore)++;
-                else
-                    (*playerScore)++;
-            }
-            else
-            {
-                /* Normal out-of-bounds: opponent of the last hitter scores */
-                if (w->lastHitter == 1)
-                    (*aiScore)++;
-                else
-                    (*playerScore)++;
-            }
+            bool outX   = fabsf(b->position.x) > w->tableW * 0.52f;
+            bool outZ   = fabsf(b->position.z) > w->tableL * 0.55f;
+            bool outY   = b->position.y < (w->tableY - 0.25f);
+            bool out    = outX || outZ || outY;
 
-            /* Take the ball out of play; serve timer will trigger next serve */
-            w->ball.inPlay  = false;
-            w->serveTimer   = 0.65f;  /* 650 ms delay before next serve */
+            /* Dead ball check: ball is on table with negligible kinetic energy */
+            bool ballDead = inTableX && inTableZ &&
+                            (b->position.y <= w->tableY + b->radius + 0.04f) &&
+                            (V3Len(b->velocity) < 0.40f);
+
+            if (out || ballDead)
+            {
+                bool hitterIsPlayer = (w->lastHitter == 1);
+
+                if (w->bouncesOnReceiverSide >= 1)
+                {
+                    /* Ball bounced legally on receiver's court, then went out or died!
+                     * Receiver failed to return it -> Hitter wins the point! */
+                    if (hitterIsPlayer) {
+                        (*playerScore)++;
+                    } else {
+                        (*aiScore)++;
+                    }
+                }
+                else
+                {
+                    /* Ball never touched receiver's court!
+                     * Hitter hit it out of bounds or into net -> Receiver wins point! */
+                    if (hitterIsPlayer) {
+                        (*aiScore)++;
+                    } else {
+                        (*playerScore)++;
+                    }
+                }
+
+                w->ball.inPlay  = false;
+                w->serveTimer   = 0.70f;
+            }
         }
     }
     else
@@ -722,14 +753,26 @@ void PhysicsUpdate(PhysicsWorld  *w,
         /* -----------------------------------------------------------------------
          * 4. Serve timer: count down and fire a new serve when expired.
          *
-         * Serves alternate: even total points → AI serves, odd → player serves.
+         * Table Tennis Service Rule:
+         *   - Alternates every 2 points during regulation play.
+         *   - Alternates every 1 point when in deuce (score >= target - 1).
          * --------------------------------------------------------------------- */
         w->serveTimer -= dt;
 
         if (w->serveTimer <= 0.0f)
         {
             int totalPoints = *playerScore + *aiScore;
-            int towardPlayer = ((totalPoints % 2) == 0) ? 1 : -1;
+            int target = (w->targetScore > 0) ? w->targetScore : 11;
+            int towardPlayer;
+
+            if (*playerScore >= (target - 1) && *aiScore >= (target - 1)) {
+                /* Deuce: service alternates every point */
+                towardPlayer = ((totalPoints % 2) == 0) ? 1 : -1;
+            } else {
+                /* Regulation: service alternates every 2 points */
+                towardPlayer = (((totalPoints / 2) % 2) == 0) ? 1 : -1;
+            }
+
             PhysicsServe(w, towardPlayer);
         }
     }
