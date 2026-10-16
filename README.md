@@ -17,7 +17,7 @@ Neon Table Tennis is a complete, public-release-quality arcade game featuring a 
 - **Arcade Physics Engine** — Semi-implicit Euler integration with gravity, quadratic air drag, Magnus effect (spin-induced curvature), energy-absorbing table bounce, net collision, and paddle-offset spin transfer.
 - **Mouse-Guided Paddle** — Moving the mouse drives the 3D paddle position mapped from screen space into the world table plane via normalized device coordinate transformation.
 - **Two Hit Types** — Left click for a standard drive; hold and release right click for a charged power smash with variable strength.
-- **AI Opponent** — Predicts the ball's landing point via forward simulation, then pursues it with bounded linear speed. Difficulty scales with match duration.
+- **CPU Opponent** — Predicts the ball's landing point via forward simulation, then pursues it with bounded linear speed. Difficulty scales with match duration.
 - **Juice & Feel** — Per-hit screen shake, camera recoil, slow-motion on smashes, glowing ball motion trail (8-frame history), and 2 000-particle burst system with O(1) spawn and removal.
 - **Complete State Machine** — Main Menu → Tutorial → Arcade Match → Pause → Game Over → Leaderboard, with clean transitions and ESC navigation.
 - **Persistent Leaderboard** — SQLite 3 local database (WAL mode) recording best score, longest rally, and cumulative win/loss totals. Database failure is non-fatal; the game remains fully playable.
