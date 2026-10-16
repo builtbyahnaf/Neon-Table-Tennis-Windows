@@ -632,6 +632,18 @@ void PhysicsUpdate(PhysicsWorld  *w,
 
         /* -------------------------------------------------------------------
          * 3c. Paddle contact checks.
+         *
+         * A paddle hit is valid when:
+         *   • The ball is still in play.
+         *   • The ball overlaps the paddle AABB (PaddleContact).
+         *   • The ball is travelling toward the respective paddle.
+         *   • The same side hasn't just hit it (prevents double-hit).
+         *
+         * No illegal-volley check here: the table-bounce section (3b) already
+         * enforces all TT scoring rules (fault-on-own-court, double-bounce).
+         * The previous volley check was falsely eliminating the ball because
+         * PaddleContact's 35 cm Z-tolerance detects the ball before it bounces,
+         * making bouncesOnReceiverSide == 0 almost always true at contact time.
          * ----------------------------------------------------------------- */
         bool playerInRange = PaddleContact(b, p);
         bool aiInRange     = PaddleContact(b, ai);
@@ -640,40 +652,14 @@ void PhysicsUpdate(PhysicsWorld  *w,
             && b->velocity.z > 0.0f       /* Ball travelling toward player  */
             && w->lastHitter != 1)         /* Player hasn't just hit it      */
         {
-            /* Check for illegal volley: in Table Tennis, hitting the ball over
-             * the table before it has bounced on your court is an obstruction fault. */
-            bool overTable = (fabsf(b->position.x) <= w->tableW * 0.5f) &&
-                             (fabsf(b->position.z) <= w->tableL * 0.5f);
-            if (w->bouncesOnReceiverSide == 0 && overTable)
-            {
-                /* Volley fault: AI scores */
-                (*aiScore)++;
-                w->ball.inPlay = false;
-                w->serveTimer  = 0.70f;
-            }
-            else
-            {
-                float power = in.smash ? in.charge : (in.hit ? 0.40f : 0.0f);
-                ApplyPaddleHit(w, p, true, power);
-            }
+            float power = in.smash ? in.charge : (in.hit ? 0.40f : 0.0f);
+            ApplyPaddleHit(w, p, true, power);
         }
         else if (w->ball.inPlay && aiInRange
                  && b->velocity.z < 0.0f  /* Ball travelling toward AI      */
                  && w->lastHitter != 2)    /* AI hasn't just hit it          */
         {
-            bool overTable = (fabsf(b->position.x) <= w->tableW * 0.5f) &&
-                             (fabsf(b->position.z) <= w->tableL * 0.5f);
-            if (w->bouncesOnReceiverSide == 0 && overTable)
-            {
-                /* Volley fault: Player scores */
-                (*playerScore)++;
-                w->ball.inPlay = false;
-                w->serveTimer  = 0.70f;
-            }
-            else
-            {
-                ApplyPaddleHit(w, ai, false, 0.05f + difficulty * 0.22f);
-            }
+            ApplyPaddleHit(w, ai, false, 0.05f + difficulty * 0.22f);
         }
 
         /* -------------------------------------------------------------------
